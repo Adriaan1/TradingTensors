@@ -14,7 +14,7 @@ class OandaEnv(BaseEnv):
     def __init__(self, INSTRUMENT, TIMEFRAME, train=True, _isLive=False,
                  mode='practice', additional_pairs=[], indicators=[],
                  trade_duration=1, lookback_period=0,
-                 planet_data={}, PLANET_FORWARD_PERIOD=0, PORTFOLIO_TYPE='FIXED PERIOD'):
+                 planet_data={}, PLANET_FORWARD_PERIOD=0, PORTFOLIO_TYPE='Buy_Sell'):
 
         assert TIMEFRAME in GRANULARITIES, "Please use this timeframe format {}".format(
             GRANULARITIES)
@@ -41,6 +41,11 @@ class OandaEnv(BaseEnv):
                 DURATION=trade_duration,
                 SYMBOL=INSTRUMENT,
                 PRECISION=PRECISION)
+        else:
+            self.portfolio = BuySellPortfolio(
+                handle=self.api_Handle,
+                SYMBOL=INSTRUMENT,
+                PRECISION=PRECISION)
 
         self.isTraining = train
         self.isLive = _isLive
@@ -51,7 +56,8 @@ class OandaEnv(BaseEnv):
 
 
     def step(self, action):
-        new_obs, portfolio_feed, DONE = self.sim.step()
+        new_obs, portfolio_feed,\
+        DONE = self.sim.step()
         ACTION, REWARD = self.portfolio.newCandleHandler(
             ACTION=action, TIME=portfolio_feed[0], 
             OPEN=portfolio_feed[1], REWARD=portfolio_feed[2])
@@ -263,6 +269,7 @@ class FixedPeriodPortfolio(BasePortfolio):
             self.curr_trade['Trade Duration'] += 1
 
             #Check if duration limit is reached
+
             reached = self.curr_trade['Trade Duration'] >= self.DURATION_LIMIT
 
             if reached:
@@ -436,3 +443,269 @@ class FixedPeriodPortfolio(BasePortfolio):
 
 
             return ACTION, REWARD
+
+
+class BuySellPortfolio(BasePortfolio):
+    '''This portfolio is meant to go long on a buy signal,
+    hold while true and then close position
+    on the following sell signal and then go short when vise versa '''
+
+    def __init__(self, **kwargs):
+        self.api_Handle = kwargs['handle']
+        self.SYMBOL = kwargs['SYMBOL']
+        self.PRECISION = kwargs['PRECISION']
+        self.reset()
+        self.isLive = False
+
+    def newCandleHandler(self, ACTION, **kwargs):
+        '''
+        In Live mode, step doesnt return anything
+        IN Training/Testing mode, step returns action and reward
+
+        TRAIN/TEST MODE:
+        kwargs = {
+            'TIME' : curr_time,
+            'OPEN' :curr_open,
+            'REWARD': reward
+        }
+
+        LIVE MODE:
+        kwargs ={}
+        '''
+
+        if self.isHoldingTrade():
+            #Increase trade duration
+            self.curr_trade['Trade Duration'] += 1
+
+            #Check if duration limit is reached
+
+            reached = self.curr_trade['Trade Duration'] >= self.DURATION_LIMIT
+
+            if reached:
+                #Close Trade
+                self.closeTrade(**kwargs)
+                print("Trade closed due to time limit reached")
+
+            else:
+                #Continue Holding
+
+                return self.continueHolding(**kwargs)
+
+        if ACTION == 2:
+            # Do Nothing
+            self.equity_curve.append(self.total_reward)
+            REWARD = 0
+            return ACTION, REWARD
+
+        else:
+            # TAKE A TRADE
+
+            return self.openTrade(action=ACTION, **kwargs)
+
+    def openTrade(self, action, **kwargs):
+
+        if self.isLive:
+            if action == 0:
+                POS_DIR = 'LONG'
+            else: POS_DIR ='SHORT'
+
+            if POS_DIR == "LONG":
+
+                if self._isHoldingTrade == False:
+                    TYPE = 'BUY'
+                    ID, TIME, PRICE = self.api_Handle.open_position(self.SYMBOL, TYPE)
+
+                    if ID is None or TIME is None or PRICE is None:
+                        # Raise Error
+                        print("Failed to initiate trade")
+                        return
+                    TIME = pd.to_datetime(TIME).to_pydatetime()
+                    self.curr_trade['Entry Time'] = TIME
+                    self.curr_trade['Entry Price'] = PRICE
+                    self.curr_trade['ID'] = ID
+                    self.curr_trade['Type'] = TYPE
+
+                    self.total_trades += 1
+                else:
+                    pass
+
+                if self.isHoldingTrade == True:
+                    if TYPE == 'SELL':
+                        self.closeTrade(**kwargs)
+                        print('*******Current trade closed due to direction change********')
+                else:
+                    pass
+
+            else:
+                POS_DIR = "SHORT"
+
+                if self._isHoldingTrade == False:
+                    TYPE = 'SELL'
+                    ID, TIME, PRICE = self.api_Handle.open_position(self.SYMBOL, TYPE)
+
+                    if ID is None or TIME is None or PRICE is None:
+                        # Raise Error
+                        print("Failed to initiate trade")
+                        return
+                    TIME = pd.to_datetime(TIME).to_pydatetime()
+                    self.curr_trade['Entry Time'] = TIME
+                    self.curr_trade['Entry Price'] = PRICE
+                    self.curr_trade['ID'] = ID
+                    self.curr_trade['Type'] = TYPE
+
+                    self.total_trades += 1
+                else:
+                    pass
+
+                if self.isHoldingTrade == True:
+                    if TYPE == 'BUY':
+                        self.closeTrade(**kwargs)
+                        print('*******Current trade closed due to direction change********')
+                    else:
+                        pass
+        else:
+            # Train/Test Mode
+            self.total_trades += 1
+
+            # Set cur_trade
+            self.curr_trade['ID'] = self.total_trades
+
+            if action == 0:
+                POS_DIR = 'LONG'
+
+                if POS_DIR == "LONG":
+
+                    if self._isHoldingTrade == False:
+                        TYPE = 'BUY'
+
+                return TYPE
+
+            else:
+                POS_DIR = 'SHORT'
+
+                if POS_DIR == 'SHORT':
+
+                    if self._isHoldingTrade == False:
+                        TYPE = 'SELL'
+                return TYPE
+
+
+            self.curr_trade['Type'] = TYPE
+
+            # Set Price and Time
+            self.curr_trade['Entry Time'] = kwargs['TIME']
+            self.curr_trade['Entry Price'] = kwargs['OPEN']
+
+            # Manipulate reward
+            rew = kwargs['REWARD']
+            multiplier = 1.0 if self.curr_trade['Type'] == 'BUY' else -1.0
+            REWARD = rew * multiplier
+
+            # Accumulate reward
+            self.curr_trade['Profit'] += REWARD
+            self.total_reward += REWARD
+
+            # Update Equity
+            self.equity_curve.append(self.total_reward)
+
+            self._isHoldingTrade = True
+            return action, REWARD
+
+
+    def closeTrade(self, **kwargs):
+        if self.isLive:
+
+            SYMBOL = self.curr_trade["Symbol"]
+            TYPE = self.curr_trade['Type']
+
+            # Close all position in this symbol
+            closeTime, closePrice, pl = self.api_Handle.closeALLposition(SYMBOL, TYPE)
+
+            if closeTime is None or closePrice is None or pl is None:
+                # Didn't Close properly
+                self.continueHolding()
+
+            # Close successfully
+            # Update curr_trade
+            closeTime = pd.to_datetime(closeTime).to_pydatetime()
+            self.curr_trade['Exit Time'] = closeTime
+            self.curr_trade['Exit Price'] = closePrice
+            self.curr_trade['Profit'] = pl / self.PRECISION
+
+            self.journal.append(self.curr_trade)
+
+            print(self.curr_trade)
+            print("")
+
+            # reset curr_trade
+            self.reset_trade()
+
+        else:
+
+            # Close the trade in Train/Test Mode
+            self.curr_trade['Exit Time'] = kwargs['TIME']
+            self.curr_trade['Exit Price'] = kwargs['OPEN']
+
+            # Recalculate reward based on this open (More accurate) thisOpen - EntryPrice
+            # Or we could leave curr_trade['Profit'] = lastClose - EntryPrice
+            '''
+            multiplier = 1.0 if self.curr_trade['Type'] == 'BUY' else -1.0
+            self.curr_trade['Profit'] = multiplier * \
+            (self.curr_trade['Exit Price'] - self.curr_trade['Entry Price'])
+            '''
+            self.journal.append(self.curr_trade)
+            self.reset_trade()
+
+            self._isHoldingTrade = False
+
+
+    def isHoldingTrade(self):
+        if self.isLive:
+
+            # curr_trade should have a record
+            TRADE_ID = self.curr_trade["ID"]
+
+            if TRADE_ID == 0:
+                self._isHoldingTrade = False
+            else:
+                self._isHoldingTrade = self.api_Handle.isTradeOpen(TRADE_ID)
+
+            return self._isHoldingTrade
+
+        else:
+            # Training/Testing
+            return self._isHoldingTrade
+
+
+    def continueHolding(self, **kwargs):
+        if self.isLive:
+
+            ID = self.curr_trade['ID']
+            SYMBOL = self.curr_trade['Symbol']
+            pl = self.api_Handle.getOpenPL(ID, SYMBOL)
+
+            self.curr_trade['Profit'] = float(pl) / self.PRECISION
+
+            self.equity_curve.append(self.curr_trade['Profit'])
+
+            return
+
+        else:
+
+            # Reset the action
+            ACTION = 2
+
+            # Manipulate reward
+            rew = kwargs['REWARD']
+            multiplier = 1.0 if self.curr_trade['Type'] == 'BUY' else -1.0
+            REWARD = rew * multiplier
+
+            # Accumulate reward
+            self.total_reward += REWARD
+            self.curr_trade['Profit'] += REWARD
+
+            # Update Equity
+            self.equity_curve.append(self.total_reward)
+
+            return ACTION, REWARD
+
